@@ -10,8 +10,8 @@ documentation = "https://docs.rs/proxy-protocol/"
 repository = "https://github.com/Proximyst/proxy-protocol.git"
 
 [dependencies]
-snafu = "0.6.9"
 bytes = "1"
+thiserror = "1"
 
 [dev-dependencies]
 pretty_assertions = "^0.7"

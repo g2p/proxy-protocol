@@ -1,25 +1,25 @@
 use bytes::{Buf, BufMut as _, BytesMut};
-use snafu::{ensure, Snafu};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
-#[derive(Debug, Snafu)]
+#[derive(Debug, thiserror::Error)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub enum ParseError {
-    #[snafu(display("an unexpected eof was hit"))]
+    #[error("an unexpected eof was hit")]
     UnexpectedEof,
 
-    #[snafu(display("invalid command: {}", cmd))]
+    #[error("invalid command: {}", cmd)]
     UnknownCommand { cmd: u8 },
 
-    #[snafu(display("invalid address family: {}", family))]
+    #[error("invalid address family: {}", family)]
     UnknownAddressFamily { family: u8 },
 
-    #[snafu(display("invalid transport protocol: {}", protocol))]
+    #[error("invalid transport protocol: {}", protocol)]
     UnknownTransportProtocol { protocol: u8 },
 
-    #[snafu(display("insufficient length specified: {}, requires minimum {}", given, needs))]
+    #[error("insufficient length specified: {}, requires minimum {}", given, needs)]
     InsufficientLengthSpecified { given: usize, needs: usize },
 }
+use ParseError::*;
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub enum ProxyCommand {
@@ -77,12 +77,14 @@ pub(crate) fn parse(buf: &mut impl Buf) -> Result<super::ProxyHeader, ParseError
     let command = match command {
         0 => ProxyCommand::Local,
         1 => ProxyCommand::Proxy,
-        cmd => return UnknownCommand { cmd }.fail(),
+        cmd => return Err(UnknownCommand { cmd }),
     };
 
     // 4 bits for address family, 4 bits for transport protocol,
     // then 2 bytes for the length.
-    ensure!(buf.remaining() >= 3, UnexpectedEof);
+    if buf.remaining() < 3 {
+        return Err(UnexpectedEof);
+    }
 
     let byte = buf.get_u8();
     let address_family = match byte >> 4 {
@@ -90,20 +92,22 @@ pub(crate) fn parse(buf: &mut impl Buf) -> Result<super::ProxyHeader, ParseError
         1 => ProxyAddressFamily::Inet,
         2 => ProxyAddressFamily::Inet6,
         3 => ProxyAddressFamily::Unix,
-        family => return UnknownAddressFamily { family }.fail(),
+        family => return Err(UnknownAddressFamily { family }),
     };
     let transport_protocol = match byte << 4 >> 4 {
         0 => ProxyTransportProtocol::Unspec,
         1 => ProxyTransportProtocol::Stream,
         2 => ProxyTransportProtocol::Datagram,
-        protocol => return UnknownTransportProtocol { protocol }.fail(),
+        protocol => return Err(UnknownTransportProtocol { protocol }),
     };
 
     let length = buf.get_u16() as usize;
 
     if address_family == ProxyAddressFamily::Unspec {
         // We have no information to parse.
-        ensure!(buf.remaining() >= length, UnexpectedEof);
+        if buf.remaining() < length {
+            return Err(UnexpectedEof);
+        }
         buf.advance(length);
 
         return Ok(super::ProxyHeader::Version2 {
@@ -135,14 +139,15 @@ pub(crate) fn parse(buf: &mut impl Buf) -> Result<super::ProxyHeader, ParseError
     // > };
 
     if address_family == ProxyAddressFamily::Unix {
-        ensure!(
-            length >= 108 * 2,
-            InsufficientLengthSpecified {
+        if length < 108 * 2 {
+            return Err(InsufficientLengthSpecified {
                 given: length,
                 needs: 108usize * 2,
-            },
-        );
-        ensure!(buf.remaining() >= 108 * 2, UnexpectedEof);
+            });
+        }
+        if buf.remaining() < 108 * 2 {
+            return Err(UnexpectedEof);
+        }
         let mut source = [0u8; 108];
         let mut destination = [0u8; 108];
         buf.copy_to_slice(&mut source[..]);
@@ -169,17 +174,15 @@ pub(crate) fn parse(buf: &mut impl Buf) -> Result<super::ProxyHeader, ParseError
         _ => unreachable!(),
     };
 
-    ensure!(
-        length >= port_length + address_length,
-        InsufficientLengthSpecified {
+    if length < port_length + address_length {
+        return Err(InsufficientLengthSpecified {
             given: length,
             needs: port_length + address_length,
-        },
-    );
-    ensure!(
-        buf.remaining() >= port_length + address_length,
-        UnexpectedEof,
-    );
+        });
+    }
+    if buf.remaining() < port_length + address_length {
+        return Err(UnexpectedEof);
+    }
 
     let addresses = if address_family == ProxyAddressFamily::Inet {
         let mut data = [0u8; 4];
@@ -343,15 +346,9 @@ pub(crate) fn encode(
     // > };
     let len = match addresses {
         ProxyAddresses::Unspec => 0,
-        ProxyAddresses::Unix { .. } => {
-            108 + 108
-        }
-        ProxyAddresses::Ipv4 { .. } => {
-            4 + 4 + 2 + 2
-        }
-        ProxyAddresses::Ipv6 { .. } => {
-            16 + 16 + 2 + 2
-        }
+        ProxyAddresses::Unix { .. } => 108 + 108,
+        ProxyAddresses::Ipv4 { .. } => 4 + 4 + 2 + 2,
+        ProxyAddresses::Ipv6 { .. } => 16 + 16 + 2 + 2,
     };
 
     let mut buf = BytesMut::with_capacity(16 + len);
@@ -685,7 +682,7 @@ mod parse_tests {
         data[0] = 99; // Make 100% sure it's invalid.
         assert!(parse(&mut &data[..]).is_err());
 
-        assert_eq!(parse(&mut &[0][..]), Err(ParseError::UnexpectedEof));
+        assert_eq!(parse(&mut &[0][..]), Err(UnexpectedEof));
 
         assert_eq!(
             parse(
@@ -700,7 +697,7 @@ mod parse_tests {
                     3,
                 ][..]
             ),
-            Err(ParseError::InsufficientLengthSpecified {
+            Err(InsufficientLengthSpecified {
                 given: 3,
                 needs: 4 * 2 + 2 * 2,
             }),
@@ -733,7 +730,7 @@ mod encode_tests {
                 ProxyTransportProtocol::Unspec,
                 ProxyAddresses::Unspec,
             ),
-            signed(&[(2 << 4) | 0, 0, 0, 0][..]),
+            signed(&[(2 << 4), 0, 0, 0][..]),
         );
 
         assert_eq!(
@@ -756,7 +753,7 @@ mod encode_tests {
             signed(
                 &[
                     (2 << 4) | 1,
-                    (1 << 4) | 0,
+                    (1 << 4),
                     0,
                     12,
                     1,
@@ -819,7 +816,7 @@ mod encode_tests {
             ),
             signed(
                 &[
-                    (2 << 4) | 0,
+                    (2 << 4),
                     (1 << 4) | 2,
                     0,
                     12,
@@ -847,12 +844,7 @@ mod encode_tests {
                 ProxyCommand::Local,
                 ProxyTransportProtocol::Datagram,
                 ProxyAddresses::Ipv6 {
-                    source: SocketAddrV6::new(
-                        Ipv6Addr::new(1, 2, 3, 4, 5, 6, 7, 8),
-                        8192,
-                        0,
-                        0,
-                    ),
+                    source: SocketAddrV6::new(Ipv6Addr::new(1, 2, 3, 4, 5, 6, 7, 8), 8192, 0, 0,),
                     destination: SocketAddrV6::new(
                         Ipv6Addr::new(65535, 65535, 32767, 32766, 111, 222, 333, 444),
                         0,
@@ -863,7 +855,7 @@ mod encode_tests {
             ),
             signed(
                 &[
-                    (2 << 4) | 0,
+                    (2 << 4),
                     (2 << 4) | 2,
                     0,
                     36,

@@ -14,34 +14,34 @@ pub mod version1;
 pub mod version2;
 
 use bytes::{Buf, BytesMut};
-use snafu::{ensure, ResultExt as _, Snafu};
 
-#[derive(Debug, Snafu)]
+#[derive(Debug, thiserror::Error)]
 #[cfg_attr(not(feature = "always_exhaustive"), non_exhaustive)] // A new version may be added
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub enum ParseError {
     /// This is not a PROXY header at all.
-    #[snafu(display("the given data is not a PROXY header"))]
+    #[error("the given data is not a PROXY header")]
     NotProxyHeader,
 
     /// This version of the PROXY protocol is unsupported or impossible.
-    #[snafu(display("the version {} is invalid", version))]
+    #[error("the version {} is invalid", version)]
     InvalidVersion { version: u32 },
 
     /// An error occurred while parsing version 1.
-    #[snafu(display("there was an error while parsing the v1 header: {}", source))]
+    #[error("there was an error while parsing the v1 header: {}", source)]
     Version1 { source: version1::ParseError },
 
     /// An error occurred while parsing version 2.
-    #[snafu(display("there was an error while parsing the v2 header: {}", source))]
+    #[error("there was an error while parsing the v2 header: {}", source)]
     Version2 { source: version2::ParseError },
 }
+use ParseError::*;
 
-#[derive(Debug, Snafu)]
+#[derive(Debug, thiserror::Error)]
 #[cfg_attr(not(feature = "always_exhaustive"), non_exhaustive)] // A new version may be added
 pub enum EncodeError {
     /// An error occurred while encoding version 1.
-    #[snafu(display("there was an error while encoding the v1 header: {}", source))]
+    #[error("there was an error while encoding the v1 header: {}", source)]
     WriteVersion1 { source: version1::EncodeError },
 }
 
@@ -75,7 +75,9 @@ pub enum ProxyHeader {
 
 fn parse_version(buf: &mut impl Buf) -> Result<u32, ParseError> {
     // There is a 6 byte header to v1, 12 byte to all binary versions.
-    ensure!(buf.remaining() >= 6, NotProxyHeader);
+    if buf.remaining() < 6 {
+        return Err(NotProxyHeader);
+    }
 
     // V1 is the only version that starts with "PROXY" (0x50 0x52 0x4F 0x58
     // 0x59), and we can therefore decide version based on that.
@@ -87,12 +89,16 @@ fn parse_version(buf: &mut impl Buf) -> Result<u32, ParseError> {
     }
 
     // Now we require 13: 12 for the prefix, 1 for the version + command
-    ensure!(buf.remaining() >= 13, NotProxyHeader);
-    ensure!(
-        buf.chunk()[..12]
-            == [0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A],
-        NotProxyHeader
-    );
+    if buf.remaining() < 13 {
+        return Err(NotProxyHeader);
+    }
+    if buf.chunk()[..12]
+        != [
+            0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+        ]
+    {
+        return Err(NotProxyHeader);
+    }
     buf.advance(12);
 
     // Note that we will now not advance the version byte on purpose, as it also
@@ -113,7 +119,7 @@ fn parse_version(buf: &mut impl Buf) -> Result<u32, ParseError> {
 
     // Interesting edge-case! This is the only time version 1 would be invalid.
     if version == 1 {
-        return InvalidVersion { version: 1u32 }.fail();
+        return Err(InvalidVersion { version: 1u32 });
     }
 
     Ok(version as u32)
@@ -131,9 +137,9 @@ pub fn parse(buf: &mut impl Buf) -> Result<ProxyHeader, ParseError> {
     };
 
     Ok(match version {
-        1 => self::version1::parse(buf).context(Version1)?,
-        2 => self::version2::parse(buf).context(Version2)?,
-        _ => return InvalidVersion { version }.fail(),
+        1 => self::version1::parse(buf).map_err(|source| Version1 { source })?,
+        2 => self::version2::parse(buf).map_err(|source| Version2 { source })?,
+        _ => return Err(InvalidVersion { version }),
     })
 }
 
@@ -144,7 +150,7 @@ pub fn parse(buf: &mut impl Buf) -> Result<ProxyHeader, ParseError> {
 pub fn encode(header: ProxyHeader) -> Result<BytesMut, EncodeError> {
     Ok(match header {
         ProxyHeader::Version1 { addresses, .. } => {
-            version1::encode(addresses).context(WriteVersion1)?
+            version1::encode(addresses).map_err(|source| EncodeError::WriteVersion1 { source })?
         }
         ProxyHeader::Version2 {
             command,
@@ -313,7 +319,7 @@ mod parse_tests {
             0x49,
             0x54,
             0x0A,
-            (2 << 4) | 0,
+            (2 << 4),
         ];
         const PREFIX_PROXY: [u8; 13] = [
             0x0D,

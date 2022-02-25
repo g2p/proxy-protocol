@@ -1,5 +1,4 @@
 use bytes::{Buf, BufMut as _, BytesMut};
-use snafu::{ensure, OptionExt as _, ResultExt as _, Snafu};
 use std::{
     io::Write as _,
     net::{AddrParseError, IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
@@ -9,34 +8,35 @@ use std::{
 const CR: u8 = 0x0D;
 const LF: u8 = 0x0A;
 
-#[derive(Debug, Snafu)]
+#[derive(Debug, thiserror::Error)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 pub enum ParseError {
-    #[snafu(display("an unexpected eof was hit"))]
+    #[error("an unexpected eof was hit")]
     UnexpectedEof,
 
-    #[snafu(display("an illegal address family was presented"))]
+    #[error("an illegal address family was presented")]
     IllegalAddressFamily,
 
-    #[snafu(display("the given input is not valid ascii text"))]
+    #[error("the given input is not valid ascii text")]
     NonAscii { source: Utf8Error },
 
-    #[snafu(display("the given input misses an address"))]
+    #[error("the given input misses an address")]
     MissingAddress,
 
-    #[snafu(display("invalid ip address"))]
+    #[error("invalid ip address")]
     InvalidAddress { source: AddrParseError },
 
-    #[snafu(display("invalid port"))]
+    #[error("invalid port")]
     InvalidPort,
 
-    #[snafu(display("illegal header ending"))]
+    #[error("illegal header ending")]
     IllegalHeaderEnding,
 }
+use ParseError::*;
 
-#[derive(Debug, Snafu)]
+#[derive(Debug, thiserror::Error)]
 pub enum EncodeError {
-    #[snafu(display("could not write to the buffer"))]
+    #[error("could not write to the buffer")]
     StdIo { source: std::io::Error },
 }
 
@@ -64,7 +64,9 @@ fn count_till_first(haystack: &[u8], needle: u8) -> Option<usize> {
 }
 
 pub(crate) fn parse(buf: &mut impl Buf) -> Result<super::ProxyHeader, ParseError> {
-    ensure!(buf.remaining() >= 4, UnexpectedEof);
+    if buf.remaining() < 4 {
+        return Err(UnexpectedEof);
+    }
 
     let step = buf.get_u8();
 
@@ -83,23 +85,28 @@ pub(crate) fn parse(buf: &mut impl Buf) -> Result<super::ProxyHeader, ParseError
             match version {
                 b'4' => ProxyAddressFamily::Tcp4,
                 b'6' => ProxyAddressFamily::Tcp6,
-                _ => return IllegalAddressFamily.fail(),
+                _ => return Err(IllegalAddressFamily),
             }
         }
         b'U' => {
             // Unknown
-            ensure!(buf.remaining() >= 6, UnexpectedEof); // Not 7, we consumed 1.
+            if buf.remaining() < 6 {
+                // Not 7, we consumed 1.
+                return Err(UnexpectedEof);
+            }
             buf.advance(6);
             ProxyAddressFamily::Unknown
         }
-        _ => return IllegalAddressFamily.fail(),
+        _ => return Err(IllegalAddressFamily),
     };
 
     if address_family == ProxyAddressFamily::Unknown {
         // Just consume up to the end.
         let mut cr = false;
         loop {
-            ensure!(buf.has_remaining(), UnexpectedEof);
+            if !buf.has_remaining() {
+                return Err(UnexpectedEof);
+            }
             let b = buf.get_u8();
             if cr && b == LF {
                 break;
@@ -112,70 +119,87 @@ pub(crate) fn parse(buf: &mut impl Buf) -> Result<super::ProxyHeader, ParseError
     }
 
     // 1 space, 4 digits, 3 dots, absolute minimum for the source.
-    ensure!(buf.remaining() >= 8, UnexpectedEof);
+    if buf.remaining() < 8 {
+        return Err(UnexpectedEof);
+    }
     buf.advance(1); // Space
 
-    let count = count_till_first(buf.chunk(), b' ').context(MissingAddress)?;
+    let count = count_till_first(buf.chunk(), b' ').ok_or(MissingAddress)?;
     let source = &buf.chunk()[..count];
-    let source = std::str::from_utf8(source).context(NonAscii)?;
+    let source = std::str::from_utf8(source).map_err(|source| NonAscii { source })?;
     let source = match address_family {
-        ProxyAddressFamily::Tcp4 => IpAddr::V4(Ipv4Addr::from_str(source).context(InvalidAddress)?),
-        ProxyAddressFamily::Tcp6 => IpAddr::V6(Ipv6Addr::from_str(source).context(InvalidAddress)?),
+        ProxyAddressFamily::Tcp4 => {
+            IpAddr::V4(Ipv4Addr::from_str(source).map_err(|source| InvalidAddress { source })?)
+        }
+        ProxyAddressFamily::Tcp6 => {
+            IpAddr::V6(Ipv6Addr::from_str(source).map_err(|source| InvalidAddress { source })?)
+        }
         ProxyAddressFamily::Unknown => unreachable!("unknown should have its own branch"),
     };
     buf.advance(count);
 
     // Same as above, another address incoming.
-    ensure!(buf.remaining() >= 8, UnexpectedEof);
+    if buf.remaining() < 8 {
+        return Err(UnexpectedEof);
+    }
     buf.advance(1); // Space
 
-    let count = count_till_first(buf.chunk(), b' ').context(MissingAddress)?;
+    let count = count_till_first(buf.chunk(), b' ').ok_or(MissingAddress)?;
     let destination = &buf.chunk()[..count];
-    let destination = std::str::from_utf8(destination).context(NonAscii)?;
+    let destination = std::str::from_utf8(destination).map_err(|source| NonAscii { source })?;
     let destination = match address_family {
         ProxyAddressFamily::Tcp4 => {
-            IpAddr::V4(Ipv4Addr::from_str(destination).context(InvalidAddress)?)
+            IpAddr::V4(Ipv4Addr::from_str(destination).map_err(|source| InvalidAddress { source })?)
         }
         ProxyAddressFamily::Tcp6 => {
-            IpAddr::V6(Ipv6Addr::from_str(destination).context(InvalidAddress)?)
+            IpAddr::V6(Ipv6Addr::from_str(destination).map_err(|source| InvalidAddress { source })?)
         }
         ProxyAddressFamily::Unknown => unreachable!("unknown should have its own branch"),
     };
     buf.advance(count);
 
     // Space, then a port. 0 is minimum valid port, so 1 byte.
-    ensure!(buf.remaining() >= 2, UnexpectedEof);
+    if buf.remaining() < 2 {
+        return Err(UnexpectedEof);
+    }
     buf.advance(1);
 
-    let count = count_till_first(buf.chunk(), b' ').context(InvalidPort)?;
+    let count = count_till_first(buf.chunk(), b' ').ok_or(InvalidPort)?;
     let source_port = &buf.chunk()[..count];
-    let source_port = std::str::from_utf8(source_port).context(NonAscii)?;
-    ensure!(
-        // The port 0 is itself valid, but 01 is not.
-        !source_port.starts_with('0') || source_port == "0",
-        InvalidPort,
-    );
-    let source_port: u16 = source_port.parse().ok().context(InvalidPort)?;
+    let source_port = std::str::from_utf8(source_port).map_err(|source| NonAscii { source })?;
+    if
+    // The port 0 is itself valid, but 01 is not.
+    source_port.starts_with('0') && source_port != "0" {
+        return Err(InvalidPort);
+    }
+    let source_port: u16 = source_port.parse().map_err(|_| InvalidPort)?;
     buf.advance(count);
 
     // Space, then a port, then CRLF. 0 is minimum valid port, so 1 byte.
-    ensure!(buf.remaining() >= 4, UnexpectedEof);
+    if buf.remaining() < 4 {
+        return Err(UnexpectedEof);
+    }
     buf.advance(1);
 
     // This is the last member of the string. Read until CR; that's next up.
-    let count = count_till_first(buf.chunk(), CR).context(InvalidPort)?;
+    let count = count_till_first(buf.chunk(), CR).ok_or(InvalidPort)?;
     let destination_port = &buf.chunk()[..count];
-    let destination_port = std::str::from_utf8(destination_port).context(NonAscii)?;
-    ensure!(
-        // The port 0 is itself valid, but 01 is not.
-        !destination_port.starts_with('0') || destination_port == "0",
-        InvalidPort,
-    );
-    let destination_port: u16 = destination_port.parse().ok().context(InvalidPort)?;
+    let destination_port =
+        std::str::from_utf8(destination_port).map_err(|source| NonAscii { source })?;
+    if
+    // The port 0 is itself valid, but 01 is not.
+    destination_port.starts_with('0') && destination_port != "0" {
+        return Err(InvalidPort);
+    }
+    let destination_port: u16 = destination_port.parse().map_err(|_| InvalidPort)?;
     buf.advance(count);
 
-    ensure!(buf.get_u8() == CR, IllegalHeaderEnding);
-    ensure!(buf.get_u8() == LF, IllegalHeaderEnding);
+    if buf.get_u8() != CR {
+        return Err(IllegalHeaderEnding);
+    }
+    if buf.get_u8() != LF {
+        return Err(IllegalHeaderEnding);
+    }
 
     let addresses = match (source, destination) {
         (IpAddr::V4(source), IpAddr::V4(destination)) => ProxyAddresses::Ipv4 {
@@ -190,9 +214,7 @@ pub(crate) fn parse(buf: &mut impl Buf) -> Result<super::ProxyHeader, ParseError
         _ => unreachable!(),
     };
 
-    Ok(super::ProxyHeader::Version1 {
-        addresses,
-    })
+    Ok(super::ProxyHeader::Version1 { addresses })
 }
 
 pub(crate) fn encode(addresses: ProxyAddresses) -> Result<BytesMut, EncodeError> {
@@ -202,14 +224,16 @@ pub(crate) fn encode(addresses: ProxyAddresses) -> Result<BytesMut, EncodeError>
 
     // Reserve as much data as we're gonna need -- at most.
     let mut buf = BytesMut::with_capacity(107).writer();
-    buf.write_all(&b"PROXY TCP"[..]).context(StdIo)?;
+    buf.write_all(&b"PROXY TCP"[..])
+        .map_err(|source| EncodeError::StdIo { source })?;
 
     match addresses {
         ProxyAddresses::Ipv4 {
             source,
             destination,
         } => {
-            buf.write(&b"4 "[..]).context(StdIo)?;
+            buf.write(&b"4 "[..])
+                .map_err(|source| EncodeError::StdIo { source })?;
             write!(
                 buf,
                 "{} {} {} {}\r\n",
@@ -218,13 +242,14 @@ pub(crate) fn encode(addresses: ProxyAddresses) -> Result<BytesMut, EncodeError>
                 source.port(),
                 destination.port(),
             )
-            .context(StdIo)?;
+            .map_err(|source| EncodeError::StdIo { source })?;
         }
         ProxyAddresses::Ipv6 {
             source,
             destination,
         } => {
-            buf.write(&b"6 "[..]).context(StdIo)?;
+            buf.write(&b"6 "[..])
+                .map_err(|source| EncodeError::StdIo { source })?;
             write!(
                 buf,
                 "{} {} {} {}\r\n",
@@ -233,7 +258,7 @@ pub(crate) fn encode(addresses: ProxyAddresses) -> Result<BytesMut, EncodeError>
                 source.port(),
                 destination.port(),
             )
-            .context(StdIo)?;
+            .map_err(|source| EncodeError::StdIo { source })?;
         }
         ProxyAddresses::Unknown => unreachable!(),
     }
